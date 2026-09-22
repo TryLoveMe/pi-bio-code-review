@@ -183,8 +183,24 @@ function planSummary(plan: AnalysisPlan): string {
   return `研究问题：${plan.researchQuestion}\n\n${steps}\n\n停止条件：${plan.stopCondition}`;
 }
 
+const INSTANCE_MARKER = Symbol.for("pi-bio-code-review.active-instance");
+
 export default function bioCodeReviewExtension(pi: ExtensionAPI): void {
+  const processRegistry = globalThis as unknown as Record<symbol, unknown>;
+
+  // 同一个 Pi 进程里只允许一个实例生效。
+  // 若同时存在项目内安装和全局安装，两份实例会各自保存独立状态：
+  // 用户批准的是其中一份，另一份仍处于方案阶段，会继续拦住所有写文件操作，导致流程死锁。
+  if (processRegistry[INSTANCE_MARKER]) {
+    return;
+  }
+  processRegistry[INSTANCE_MARKER] = true;
+
   let state = initialState();
+
+  pi.on("session_shutdown", async () => {
+    delete processRegistry[INSTANCE_MARKER];
+  });
 
   pi.registerFlag("bio-code-only", {
     description: "启动生信分析的先审方案、只写代码模式",

@@ -95,36 +95,37 @@ approve
 
 ## 安装
 
-### 安装到单个项目
+**只安装一次。** 全局安装和项目内安装只能选一个。
 
-在目标项目根目录运行：
+同时装两份会加载两个互相独立的实例：你批准了其中一份，另一份仍停在方案阶段，会继续拦住所有写文件操作，让流程卡死。当前版本已加入防重复保护（第二份实例自动停用），但正确的做法仍然是只装一份。
 
-```bash
-mkdir -p .pi/extensions/bio-code-review
-curl -L https://raw.githubusercontent.com/TryLoveMe/pi-bio-code-review/main/.pi/extensions/bio-code-review/index.ts \
-  -o .pi/extensions/bio-code-review/index.ts
-```
+### 安装为全局 extension（推荐）
 
-### 安装为全局 extension
+装一次，所有项目都能用：
 
 ```bash
 mkdir -p ~/.pi/agent/extensions/bio-code-review
-curl -L https://raw.githubusercontent.com/TryLoveMe/pi-bio-code-review/main/.pi/extensions/bio-code-review/index.ts \
+curl -L https://raw.githubusercontent.com/TryLoveMe/pi-bio-code-review/main/extension/index.ts \
   -o ~/.pi/agent/extensions/bio-code-review/index.ts
+```
+
+### 安装到单个项目
+
+只在这个项目里生效，需要 Pi 信任该项目后才会加载：
+
+```bash
+mkdir -p .pi/extensions/bio-code-review
+curl -L https://raw.githubusercontent.com/TryLoveMe/pi-bio-code-review/main/extension/index.ts \
+  -o .pi/extensions/bio-code-review/index.ts
 ```
 
 只应安装你已阅读并信任的 extension。Pi extension 与本机进程拥有相同权限。
 
 ## 加载方法
 
-本仓库中的 extension 位于：
+本仓库的扩展源码位于 `extension/index.ts`，不在自动加载目录内，所以克隆仓库本身不会自动启用它。
 
-```text
-.pi/extensions/bio-code-review/index.ts
-```
-
-Pi 信任当前项目后会自动发现它。已经打开 Pi 时运行：
-
+安装后运行：
 ```text
 /reload
 ```
@@ -154,6 +155,22 @@ pi --bio-code-only
 它不拦截用户自己输入的 `!` / `!!` 命令，因为“由用户亲自运行”是这个流程的目的。
 
 第三方 extension 可以注册任意名称的新工具。若某个第三方工具使用不明显的名称却在内部执行程序，第一版无法仅凭名称识别。正式长期使用前，应根据你实际启用的工具清单补充禁止名单，或者在专用 Pi 配置中只启用只读和写文件工具。
+
+## 开发与测试
+
+流程测试用假的 Pi API 装载扩展，按真实使用顺序跑一遗：方案阶段 → 批准 → 只写代码 → 检查锁定 → 会话恢复，共 42 项断言。
+
+```bash
+bun tests/flow.test.mjs
+```
+
+测试需要能解析 `@earendil-works/pi-ai`、`@earendil-works/pi-tui`、`typebox`。装有 Pi 的机器上可以直接链到全局包：
+
+```bash
+mkdir -p node_modules/@earendil-works
+ln -sfn "$(dirname "$(command -v pi)")/../lib/node_modules/@earendil-works/pi-coding-agent" node_modules/@earendil-works/pi-coding-agent
+# 再把 pi-coding-agent/node_modules 下的 pi-ai、pi-tui、typebox 链到 node_modules
+```
 
 ## 第一版暂未实现
 
