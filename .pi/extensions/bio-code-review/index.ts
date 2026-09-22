@@ -111,6 +111,22 @@ function numberedCode(content: string): string {
     .join("\n");
 }
 
+function isNaturalApproval(text: string): boolean {
+  const normalized = text.trim().toLowerCase().replace(/[。！!，,；;：:\s]+/g, "");
+  return new Set([
+    "同意",
+    "同意方案",
+    "批准",
+    "批准方案",
+    "按这个方案做",
+    "可以开始",
+    "approve",
+    "approved",
+    "yes",
+    "ok",
+  ]).has(normalized);
+}
+
 function executionToolReason(toolName: string): string | undefined {
   const name = toolName.toLowerCase();
   const exact = new Set([
@@ -143,7 +159,7 @@ function updateUi(ctx: ExtensionContext, state: WorkflowState): void {
   ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg(color, `生信代码审查：${phaseLabel(state.phase)}`));
 
   const line = state.phase === "planning"
-    ? "先审方案；此时不能写文件或运行分析。提交方案后使用 /bio-approve。"
+    ? "先审方案；此时不能写文件或运行分析。提交方案后可说“同意”，或使用 /bio-approve。"
     : state.phase === "coding"
       ? `只允许在 ${state.deliveryRoot}/ 写代码；AI 不能运行分析。完成后使用 /bio-check。`
       : `代码已锁定；对照文档位于 ${state.deliveryRoot}/代码步骤对照.md。`;
@@ -237,7 +253,7 @@ export default function bioCodeReviewExtension(pi: ExtensionAPI): void {
       return {
         content: [{
           type: "text",
-          text: `${planSummary(state.plan)}\n\n方案已记录，但尚未批准。必须等待用户运行 /bio-approve。`,
+          text: `${planSummary(state.plan)}\n\n方案已记录，但尚未批准。等待用户输入“同意/批准/approve”或运行 /bio-approve。`,
         }],
         details: { plan: state.plan },
       };
@@ -250,6 +266,58 @@ export default function bioCodeReviewExtension(pi: ExtensionAPI): void {
       return new Text(text?.type === "text" ? theme.fg("text", text.text) : "", 0, 0);
     },
   });
+
+  async function approveCurrentPlan(
+    ctx: ExtensionContext,
+    options: { explicitNaturalApproval: boolean; commandArgs?: string },
+  ): Promise<void> {
+    if (!state.enabled || state.phase !== "planning") {
+      ctx.ui.notify("当前不在可批准的方案阶段。请先使用 /bio-start。", "warning");
+      return;
+    }
+
+    if (!state.plan) {
+      ctx.ui.notify("你已经表示同意，但 AI 还没有正式提交方案。正在要求 AI 立即提交。", "warning");
+      pi.sendUserMessage(
+        "我已经明确表示希望继续，但当前还没有可批准的正式方案。请根据已经确认的信息，立即使用 bio_submit_plan 提交最短可行方案。仍缺的信息列入 unresolvedQuestions，并在代码中设置运行前停止检查；不要继续重复询问，也不要写代码或运行分析。",
+      );
+      return;
+    }
+
+    const unresolvedCount = state.plan.unresolvedQuestions.length;
+    let approved = options.explicitNaturalApproval || options.commandArgs?.trim().toLowerCase() === "yes";
+
+    if (unresolvedCount > 0) {
+      if (ctx.hasUI) {
+        approved = await ctx.ui.confirm(
+          "方案仍有待确认信息，仍然批准？",
+          `还有 ${unresolvedCount} 个待确认问题。继续后，代码必须把这些内容作为参数或运行前停止检查，不能自行猜测。`,
+        );
+      } else if (!approved) {
+        ctx.ui.notify(`方案仍有 ${unresolvedCount} 个待确认问题；无界面模式请使用 /bio-approve yes 明确批准。`, "warning");
+        return;
+      }
+    } else if (!options.explicitNaturalApproval && ctx.hasUI) {
+      approved = await ctx.ui.confirm(
+        "批准生信分析方案？",
+        `${planSummary(state.plan)}\n\n批准后，AI 只能在 ${state.deliveryRoot}/ 内写代码，仍不能运行分析。`,
+      );
+    }
+
+    if (!approved) {
+      ctx.ui.notify("未批准方案。", "info");
+      return;
+    }
+
+    state.phase = "coding";
+    state.approvedAt = new Date().toISOString();
+    persist(pi, state);
+    updateUi(ctx, state);
+    ctx.ui.notify("方案已批准：现在只允许写代码，不允许运行分析。", "info");
+    pi.sendUserMessage(
+      `我已批准当前方案。请严格按照已批准的步骤，在 ${state.deliveryRoot}/ 内生成代码和 README；不要运行任何分析。完成后提醒我使用 /bio-check。`,
+    );
+  }
 
   pi.registerCommand("bio-start", {
     description: "开始生信分析的先审方案、只写代码流程：/bio-start [交付目录]",
@@ -278,38 +346,7 @@ export default function bioCodeReviewExtension(pi: ExtensionAPI): void {
   pi.registerCommand("bio-approve", {
     description: "批准当前方案，允许 AI 在交付目录内写代码，但仍禁止运行分析",
     handler: async (args, ctx) => {
-      if (!state.enabled || state.phase !== "planning" || !state.plan) {
-        ctx.ui.notify("当前没有可批准的方案。", "warning");
-        return;
-      }
-      if (state.plan.unresolvedQuestions.length > 0) {
-        ctx.ui.notify(
-          `方案仍列有 ${state.plan.unresolvedQuestions.length} 个待确认问题。请先让 AI 更新方案并重新提交。`,
-          "warning",
-        );
-        return;
-      }
-
-      let approved = args.trim().toLowerCase() === "yes";
-      if (ctx.hasUI) {
-        approved = await ctx.ui.confirm(
-          "批准生信分析方案？",
-          `${planSummary(state.plan)}\n\n批准后，AI 只能在 ${state.deliveryRoot}/ 内写代码，仍不能运行分析。`,
-        );
-      }
-      if (!approved) {
-        ctx.ui.notify("未批准方案。", "info");
-        return;
-      }
-
-      state.phase = "coding";
-      state.approvedAt = new Date().toISOString();
-      persist(pi, state);
-      updateUi(ctx, state);
-      ctx.ui.notify("方案已批准：现在只允许写代码，不允许运行分析。", "info");
-      pi.sendUserMessage(
-        `我已批准当前方案。请严格按照已批准的步骤，在 ${state.deliveryRoot}/ 内生成代码和 README；不要运行任何分析。完成后提醒我使用 /bio-check。`,
-      );
+      await approveCurrentPlan(ctx, { explicitNaturalApproval: false, commandArgs: args });
     },
   });
 
@@ -413,6 +450,14 @@ export default function bioCodeReviewExtension(pi: ExtensionAPI): void {
     },
   });
 
+  pi.on("input", async (event, ctx) => {
+    if (event.source === "extension" || !state.enabled || state.phase !== "planning") return;
+    if (!isNaturalApproval(event.text)) return;
+
+    await approveCurrentPlan(ctx, { explicitNaturalApproval: true });
+    return { action: "handled" as const };
+  });
+
   pi.on("tool_call", async (event, ctx) => {
     if (!state.enabled) return;
 
@@ -468,7 +513,7 @@ export default function bioCodeReviewExtension(pi: ExtensionAPI): void {
 2. 提交“最短可行方案”。步骤只分为“必要、条件触发、可选”；条件未满足时不执行条件触发步骤，可选步骤默认不做。
 3. 每一步都必须写清：做什么、为什么、不做会影响哪个判断、对应哪些实际代码文件、会产生什么输出。
 4. 不加入无法说明必要性的聚类、富集、网络、机器学习或重复质控。达到停止条件就结束。
-5. 使用 bio_submit_plan 提交方案。提交后停止，等待用户运行 /bio-approve。`,
+5. 使用 bio_submit_plan 提交方案。提交后停止，等待用户输入“同意/批准/approve”或运行 /bio-approve。`,
         },
       };
     }
