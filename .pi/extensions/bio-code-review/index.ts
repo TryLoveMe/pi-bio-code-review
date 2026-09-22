@@ -269,6 +269,9 @@ export default function bioCodeReviewExtension(pi: ExtensionAPI): void {
       persist(pi, state);
       updateUi(ctx, state);
       ctx.ui.notify("已进入方案阶段：先说明最短可行方案，禁止写代码和运行分析。", "info");
+      pi.sendUserMessage(
+        "请开始生信代码审查流程。先根据我当前提供的信息判断还缺哪些会影响方法选择的内容；需要确认时集中提问，信息足够后提交最短可行方案。不要写代码，不要运行分析。",
+      );
     },
   });
 
@@ -304,6 +307,9 @@ export default function bioCodeReviewExtension(pi: ExtensionAPI): void {
       persist(pi, state);
       updateUi(ctx, state);
       ctx.ui.notify("方案已批准：现在只允许写代码，不允许运行分析。", "info");
+      pi.sendUserMessage(
+        `我已批准当前方案。请严格按照已批准的步骤，在 ${state.deliveryRoot}/ 内生成代码和 README；不要运行任何分析。完成后提醒我使用 /bio-check。`,
+      );
     },
   });
 
