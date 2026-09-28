@@ -8,7 +8,7 @@
  * 运行：bun tests/flow.test.mjs
  */
 
-import { mkdtemp, mkdir, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, mkdir, readFile, unlink, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -34,7 +34,9 @@ function makePi(entries = []) {
   const tools = new Map();
   const flags = new Map();
   const handlers = new Map();
+  const entryRenderers = new Map();
   const sentUserMessages = [];
+  const sentMessages = [];
   const notifications = [];
 
   return {
@@ -42,7 +44,9 @@ function makePi(entries = []) {
     tools,
     flags,
     handlers,
+    entryRenderers,
     sentUserMessages,
+    sentMessages,
     entries,
     notifications,
     on(event, handler) {
@@ -60,6 +64,12 @@ function makePi(entries = []) {
     },
     sendUserMessage(text) {
       sentUserMessages.push(text);
+    },
+    sendMessage(message) {
+      sentMessages.push(message);
+    },
+    registerEntryRenderer(customType, renderer) {
+      entryRenderers.set(customType, renderer);
     },
     appendEntry(customType, data) {
       entries.push({ type: "custom", customType, data });
@@ -166,8 +176,8 @@ const main = async () => {
   module.default(pi);
 
   check(
-    "注册了 5 个命令",
-    ["bio-start", "bio-approve", "bio-status", "bio-check", "bio-reset"].every((name) => pi.commands.has(name)),
+    "注册了 6 个命令",
+    ["bio-start", "bio-approve", "bio-status", "bio-check", "bio-run", "bio-reset"].every((name) => pi.commands.has(name)),
     [...pi.commands.keys()].join(","),
   );
   check("注册了 bio_submit_plan 工具", pi.tools.has("bio_submit_plan"));
@@ -261,33 +271,79 @@ const main = async () => {
   check("只写代码阶段禁止 ctx_execute", evalBlock.length === 1 && evalBlock[0].block === true);
 
   // ---------- E. 检查与锁定 ----------
+  const deliveryRoot = join(cwd, "bio-analysis-delivery");
+  const docPath = join(deliveryRoot, "代码步骤对照.md");
+
   const missingCheckCtx = makeCtx({ cwd, pi, hasUI: true });
   await pi.commands.get("bio-check").handler("", missingCheckCtx);
-  check(
-    "脚本缺失时 bio-check 不锁定",
-    (await currentStatus(pi, ctx)).includes("只写代码") &&
-      missingCheckCtx.calls.notify.some((n) => n.level === "error"),
-    JSON.stringify(missingCheckCtx.calls.notify),
-  );
+  const missingDoc = existsSync(docPath) ? await readFile(docPath, "utf8") : "";
+  check("脚本缺失时仍然生成对照文档", missingDoc.includes("缺少的声明脚本：") && missingDoc.includes(SCRIPT_A));
+  check("脚本缺失时标注未锁定", missingDoc.includes("存在偏差，未锁定"));
+  check("脚本缺失时不锁定阶段", (await currentStatus(pi, ctx)).includes("只写代码"));
+  check("检查结果写入会话卡片", pi.entries.some((e) => e.customType === "bio-check-result"));
+  check("检查结果同时进入下一轮上下文", pi.sentMessages.length > 0);
 
-  const deliveryRoot = join(cwd, "bio-analysis-delivery");
   await mkdir(join(deliveryRoot, "scripts"), { recursive: true });
   await writeFile(join(deliveryRoot, SCRIPT_A), "# 检查样本名与分组表是否一致\nstopifnot(all(names(counts) == groups$sample))\n", "utf8");
   await writeFile(join(deliveryRoot, SCRIPT_B), "# 两组差异分析\nres <- run_diff(counts, groups)\n", "utf8");
+  const extraScript = "scripts/99_临时补跑.R";
+  await writeFile(join(deliveryRoot, extraScript), "# 方案里没写这个文件\nprint('extra')\n", "utf8");
 
+  const extraCheckCtx = makeCtx({ cwd, pi, hasUI: true });
+  await pi.commands.get("bio-check").handler("", extraCheckCtx);
+  const extraDoc = await readFile(docPath, "utf8");
+  check("能发现方案里未声明的脚本", extraDoc.includes("未在方案中声明的脚本") && extraDoc.includes(extraScript));
+  check("有未声明脚本时不锁定", extraDoc.includes("存在偏差，未锁定") && (await currentStatus(pi, ctx)).includes("只写代码"));
+  check("未声明的脚本也列出实际代码", extraDoc.includes("print('extra')"));
+
+  await unlink(join(deliveryRoot, extraScript));
   const passCheckCtx = makeCtx({ cwd, pi, hasUI: true });
   await pi.commands.get("bio-check").handler("", passCheckCtx);
   check("脚本齐全时 bio-check 通过并锁定", (await currentStatus(pi, ctx)).includes("代码已锁定"));
 
-  const docPath = join(deliveryRoot, "代码步骤对照.md");
-  const doc = existsSync(docPath) ? await readFile(docPath, "utf8") : "";
-  check("生成代码步骤对照.md", doc.length > 0);
+  const doc = await readFile(docPath, "utf8");
   check("对照文档含步骤说明", doc.includes("核对样本与分组") && doc.includes("不做的影响"));
   check("对照文档含实际代码与行号", doc.includes("stopifnot(all(names(counts) == groups$sample))") && /\n\s+1 \| /.test(doc));
   check("对照文档声明未运行分析", doc.includes("没有运行任何分析"));
 
   const lockedWrite = (await emit(pi, "tool_call", { toolName: "write", input: { path: join(deliveryRoot, "scripts/03.R") } }, ctx)).filter(Boolean);
   check("锁定后写文件被拦截", lockedWrite.length === 1 && lockedWrite[0].block === true);
+
+  // ---------- H. 执行放行通道 ----------
+  const blockedBash = (await emit(pi, "tool_call", { toolName: "bash", input: { command: "Rscript 01.R" } }, ctx)).filter(Boolean);
+  check(
+    "未授权时的拦截提示直接告知 /bio-run 与 /bio-reset",
+    blockedBash[0]?.reason.includes("/bio-run") && blockedBash[0]?.reason.includes("/bio-reset"),
+    blockedBash[0]?.reason,
+  );
+
+  const runCtx = makeCtx({ cwd, pi, hasUI: true, confirmAnswer: true });
+  await pi.commands.get("bio-run").handler("", runCtx);
+  check("/bio-run 需要用户确认", runCtx.calls.confirm.some((c) => c.title.includes("授权")));
+  check("授权后状态栏标明已授权", (await currentStatus(pi, ctx)).includes("已授权执行"));
+  check(
+    "/bio-run 授权后可以执行分析",
+    (await emit(pi, "tool_call", { toolName: "bash", input: { command: "Rscript 01.R" } }, ctx)).filter(Boolean).length === 0,
+  );
+  check(
+    "授权后可以写交付目录之外的结果文件",
+    (await emit(pi, "tool_call", { toolName: "write", input: { path: join(cwd, "results/tables/02_差异结果.csv") } }, ctx)).filter(Boolean).length === 0,
+  );
+  check(
+    "授权后 data/raw 仍然只读",
+    (await emit(pi, "tool_call", { toolName: "write", input: { path: join(cwd, "data/raw/counts.csv") } }, ctx)).filter(Boolean).length === 1,
+  );
+  check(
+    "授权后 .git 仍然只读",
+    (await emit(pi, "tool_call", { toolName: "write", input: { path: join(cwd, ".git/hooks/pre-commit") } }, ctx)).filter(Boolean).length === 1,
+  );
+
+  await pi.commands.get("bio-run").handler("off", runCtx);
+  check(
+    "/bio-run off 收回后不能执行分析",
+    (await emit(pi, "tool_call", { toolName: "bash", input: { command: "Rscript 01.R" } }, ctx)).filter(Boolean).length === 1,
+  );
+  check("收回授权后状态栏去掉标记", !(await currentStatus(pi, ctx)).includes("已授权执行"));
 
   // ---------- F. 会话恢复与重载 ----------
   const piResumed = makePi(pi.entries);
@@ -301,7 +357,7 @@ const main = async () => {
   const piReloaded = makePi(pi.entries);
   const reloadedCtx = makeCtx({ cwd, pi: piReloaded, hasUI: true });
   module.default(piReloaded);
-  check("重载后重新生效", piReloaded.commands.size === 5);
+  check("重载后重新生效", piReloaded.commands.size === 6);
   check("重载后恢复已锁定状态", (await currentStatus(piReloaded, reloadedCtx)).includes("代码已锁定"));
 
   // ---------- G. 重新开始一轮 ----------

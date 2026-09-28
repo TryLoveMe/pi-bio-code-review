@@ -1,9 +1,9 @@
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { StringEnum } from "@earendil-works/pi-ai";
-import { Text } from "@earendil-works/pi-tui";
+import { Box, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { mkdir, readFile, writeFile } from "node:fs/promises";
-import { extname, isAbsolute, relative, resolve } from "node:path";
+import { mkdir, readFile, readdir, writeFile } from "node:fs/promises";
+import { extname, isAbsolute, join, relative, resolve } from "node:path";
 
 const STATE_ENTRY = "bio-code-review-state";
 const STATUS_KEY = "bio-code-review";
@@ -37,9 +37,16 @@ interface WorkflowState {
   enabled: boolean;
   phase: Phase;
   deliveryRoot: string;
+  /** 用户是否已用 /bio-run 授权 AI 执行分析。默认 false。 */
+  executionAllowed?: boolean;
   plan?: AnalysisPlan;
   approvedAt?: string;
   checkedAt?: string;
+}
+
+interface CheckReport {
+  ok: boolean;
+  lines: string[];
 }
 
 const StepSchema = Type.Object({
@@ -65,7 +72,7 @@ const PlanSchema = Type.Object({
 });
 
 function initialState(): WorkflowState {
-  return { enabled: false, phase: "off", deliveryRoot: DEFAULT_ROOT };
+  return { enabled: false, phase: "off", deliveryRoot: DEFAULT_ROOT, executionAllowed: false };
 }
 
 function normalizeRelativePath(input: string): string | undefined {
@@ -79,6 +86,15 @@ function normalizeRelativePath(input: string): string | undefined {
 function isInside(parent: string, candidate: string): boolean {
   const rel = relative(parent, candidate);
   return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
+}
+
+/** 即使已授权执行，这些位置仍然只读。 */
+function protectedWriteReason(inputPath: string): string | undefined {
+  const normalized = inputPath.replaceAll("\\", "/");
+  if (normalized.includes(".git/")) return "版本库 .git/ ";
+  if (/(^|\/)\.env(\.|$)/.test(normalized)) return "密钥配置 .env ";
+  if (/(^|\/)data\/raw(\/|$)/.test(normalized)) return "原始数据目录 data/raw/ ";
+  return undefined;
 }
 
 function phaseLabel(phase: Phase): string {
@@ -156,13 +172,16 @@ function updateUi(ctx: ExtensionContext, state: WorkflowState): void {
   }
 
   const color = state.phase === "planning" ? "warning" : state.phase === "locked" ? "success" : "accent";
-  ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg(color, `生信代码审查：${phaseLabel(state.phase)}`));
+  const runTag = state.executionAllowed ? "｜已授权执行" : "";
+  ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg(color, `生信代码审查：${phaseLabel(state.phase)}${runTag}`));
 
   const line = state.phase === "planning"
     ? "先审方案；此时不能写文件或运行分析。提交方案后可说“同意”，或使用 /bio-approve。"
-    : state.phase === "coding"
-      ? `只允许在 ${state.deliveryRoot}/ 写代码；AI 不能运行分析。完成后使用 /bio-check。`
-      : `代码已锁定；对照文档位于 ${state.deliveryRoot}/代码步骤对照.md。`;
+    : state.executionAllowed
+      ? "已授权 AI 执行分析。收回授权：/bio-run off；退出模式：/bio-reset。"
+      : state.phase === "coding"
+        ? `只允许在 ${state.deliveryRoot}/ 写代码；AI 不能运行分析。要授权执行请用 /bio-run。`
+        : `代码已锁定；对照文档位于 ${state.deliveryRoot}/代码步骤对照.md。要授权 AI 执行请用 /bio-run。`;
   ctx.ui.setWidget(WIDGET_KEY, [ctx.ui.theme.fg("dim", line)], { placement: "belowEditor" });
 }
 
@@ -373,8 +392,16 @@ export default function bioCodeReviewExtension(pi: ExtensionAPI): void {
         `状态：${phaseLabel(state.phase)}`,
         `交付目录：${state.deliveryRoot}/`,
         `方案：${state.plan ? `${state.plan.steps.length} 步` : "尚未提交"}`,
+        `执行授权：${state.executionAllowed ? "已授权，AI 可以运行分析" : "未授权，AI 不能运行分析"}`,
         state.approvedAt ? `批准时间：${state.approvedAt}` : "批准时间：无",
         state.checkedAt ? `检查时间：${state.checkedAt}` : "检查时间：无",
+        state.phase === "off"
+          ? "下一步：运行 /bio-start 开始"
+          : state.phase === "planning"
+            ? "下一步：说“同意”或运行 /bio-approve"
+            : state.phase === "coding"
+              ? "下一步：AI 写完代码后运行 /bio-check；要授权执行用 /bio-run"
+              : "下一步：脚本由你运行，或用 /bio-run 授权 AI 执行",
       ];
       ctx.ui.notify(lines.join("\n"), "info");
     },
@@ -383,19 +410,29 @@ export default function bioCodeReviewExtension(pi: ExtensionAPI): void {
   pi.registerCommand("bio-check", {
     description: "不运行分析；检查方案中的脚本并生成逐步实际代码对照文档",
     handler: async (_args, ctx) => {
-      if (!state.enabled || state.phase !== "coding" || !state.plan) {
-        ctx.ui.notify("只有方案批准且代码生成后才能检查。", "warning");
+      if (!state.enabled) {
+        ctx.ui.notify("当前未启用流程（状态：未启用）。先运行 /bio-start 提交方案。", "warning");
+        return;
+      }
+      if (!state.plan) {
+        ctx.ui.notify("还没有正式方案。先让 AI 用 bio_submit_plan 提交方案，再说“同意”或运行 /bio-approve。", "warning");
+        return;
+      }
+      if (state.phase === "planning") {
+        ctx.ui.notify("方案还没批准，AI 也还没写代码。先说“同意”或运行 /bio-approve。", "warning");
         return;
       }
 
       const root = resolve(ctx.cwd, state.deliveryRoot);
       const missing: string[] = [];
       const empty: string[] = [];
+      const declared = new Set<string>();
       const sections: string[] = [];
 
       for (const step of state.plan.steps) {
         const fileSections: string[] = [];
         for (const file of step.codeFiles) {
+          declared.add(file);
           const absolute = resolve(root, file);
           if (!isInside(root, absolute)) {
             missing.push(`${file}（路径越界）`);
@@ -425,29 +462,138 @@ export default function bioCodeReviewExtension(pi: ExtensionAPI): void {
         );
       }
 
-      if (missing.length > 0 || empty.length > 0) {
-        const problems = [
-          missing.length ? `缺少文件：${missing.join("、")}` : "",
-          empty.length ? `空文件：${empty.join("、")}` : "",
-        ].filter(Boolean).join("\n");
-        ctx.ui.notify(`代码检查未通过。\n${problems}`, "error");
-        return;
-      }
+      // 交付目录里实际存在、方案却没声明的脚本。AI 改文件名或合并脚本时会走到这里。
+      const extras: Array<{ file: string; section: string }> = [];
+      const collectExtras = async (dir: string): Promise<void> => {
+        let entries;
+        try {
+          entries = await readdir(dir, { withFileTypes: true });
+        } catch {
+          return;
+        }
+        for (const entry of entries) {
+          const absolute = join(dir, entry.name);
+          const relativePath = relative(root, absolute).replaceAll("\\", "/");
+          if (entry.isDirectory()) {
+            if (relativePath === ".git" || relativePath === "node_modules") continue;
+            await collectExtras(absolute);
+            continue;
+          }
+          if (!/\.(r|py|sh|jl|ipynb)$/i.test(entry.name)) continue;
+          if (relativePath === "代码步骤对照.md" || declared.has(relativePath)) continue;
+          const source = await readFile(absolute, "utf8").catch(() => "");
+          extras.push({
+            file: relativePath,
+            section:
+              `### 未在方案中声明的脚本：\`${relativePath}\`\n\n` +
+              `这个文件在交付目录里，但已批准的方案没写它。可能是有意新增，也可能是改了文件名。\n\n` +
+              `\`\`\`${languageFor(relativePath)}\n${numberedCode(source)}\n\`\`\``,
+          });
+        }
+      };
+      await collectExtras(root);
+      extras.sort((a, b) => a.file.localeCompare(b.file));
 
-      const document =
-        `# 生信分析步骤与实际代码对照\n\n` +
-        `> 本文档只核对方案与脚本的对应关系，没有运行任何分析。代码能被读取不代表统计设计一定正确。\n\n` +
-        `## 研究问题\n\n${state.plan.researchQuestion}\n\n` +
-        `## 分析停止条件\n\n${state.plan.stopCondition}\n\n` +
-        sections.join("\n\n") + "\n";
+      const complete = missing.length === 0 && empty.length === 0 && extras.length === 0;
+      const declaredCount = [...declared].length;
+      const extraNames = extras.map((item) => item.file).join("、");
+
+      const document = [
+        "# 生信分析步骤与实际代码对照",
+        "",
+        "> 本文档只核对方案与脚本的对应关系，没有运行任何分析。代码能被读取不代表统计设计一定正确。",
+        "",
+        "## 检查结果",
+        "",
+        `- 方案步骤：${state.plan.steps.length} 步，声明脚本 ${declaredCount} 个`,
+        `- 缺少的声明脚本：${missing.length ? missing.join("、") : "无"}`,
+        `- 空文件：${empty.length ? empty.join("、") : "无"}`,
+        `- 交付目录里未声明的脚本：${extraNames || "无"}`,
+        `- 结论：${complete ? "方案与脚本一一对应，已锁定" : "存在偏差，未锁定"}`,
+        "",
+        "## 研究问题",
+        "",
+        state.plan.researchQuestion,
+        "",
+        "## 分析停止条件",
+        "",
+        state.plan.stopCondition,
+        "",
+        sections.join("\n\n"),
+        extras.length ? `\n## 未在方案中声明的脚本\n\n${extras.map((item) => item.section).join("\n\n")}` : "",
+        "",
+      ].join("\n");
 
       await mkdir(root, { recursive: true });
       await writeFile(resolve(root, "代码步骤对照.md"), document, "utf8");
-      state.phase = "locked";
+
+      state.phase = complete ? "locked" : "coding";
       state.checkedAt = new Date().toISOString();
       persist(pi, state);
       updateUi(ctx, state);
-      ctx.ui.notify(`检查通过并已锁定：${state.deliveryRoot}/代码步骤对照.md`, "info");
+
+      const lines = [
+        complete ? "检查通过：方案与脚本一一对应，代码已锁定。" : "检查有偏差：代码未锁定。",
+        `方案 ${state.plan.steps.length} 步，声明脚本 ${declaredCount} 个。`,
+        missing.length ? `缺少：${missing.join("、")}` : "",
+        empty.length ? `空文件：${empty.join("、")}` : "",
+        extraNames ? `方案里没写、但交付目录里有的脚本：${extraNames}` : "",
+        `对照文档：${state.deliveryRoot}/代码步骤对照.md`,
+        complete
+          ? "下一步：脚本由你自己运行；要交给 AI 执行，先用 /bio-run 授权。"
+          : "下一步：让 AI 补齐缺少的脚本，或把它新增/改名的脚本写进方案，然后重新 /bio-check。",
+      ].filter(Boolean);
+      const report = lines.join("\n");
+
+      pi.appendEntry<CheckReport>("bio-check-result", { ok: complete, lines });
+      pi.sendMessage(
+        { customType: "bio-check-result-for-agent", display: false, content: `[生信代码检查结果]\n${report}` },
+        { deliverAs: "nextTurn" },
+      );
+      ctx.ui.notify(report, complete ? "info" : "warning");
+    },
+  });
+
+  pi.registerCommand("bio-run", {
+    description: "授权 AI 执行分析（默认禁止）；/bio-run off 收回授权",
+    handler: async (args, ctx) => {
+      if (!state.enabled) {
+        ctx.ui.notify("当前未启用流程（状态：未启用）。先运行 /bio-start 提交方案。", "warning");
+        return;
+      }
+      if (args.trim().toLowerCase() === "off") {
+        state.executionAllowed = false;
+        persist(pi, state);
+        updateUi(ctx, state);
+        ctx.ui.notify("已收回执行授权：AI 不能再运行分析。", "info");
+        return;
+      }
+      if (state.phase !== "coding" && state.phase !== "locked") {
+        ctx.ui.notify(`当前阶段是「${phaseLabel(state.phase)}」，不能授权执行。先提交方案并批准。`, "warning");
+        return;
+      }
+
+      let allowed = true;
+      if (ctx.hasUI) {
+        allowed = await ctx.ui.confirm(
+          "授权 AI 执行分析？",
+          "授权后 AI 可以运行脚本，并可在交付目录之外写入分析结果。\n" +
+            "data/raw、.git、.env 仍然保持只读。\n" +
+            "随时可以用 /bio-run off 收回授权。",
+        );
+      }
+      if (!allowed) {
+        ctx.ui.notify("未授权执行。", "info");
+        return;
+      }
+
+      state.executionAllowed = true;
+      persist(pi, state);
+      updateUi(ctx, state);
+      ctx.ui.notify("已授权执行：AI 现在可以运行分析。收回请用 /bio-run off。", "info");
+      pi.sendUserMessage(
+        "我已经用 /bio-run 授权你执行分析。请按已批准方案运行，如实报告真实输出与检查结果；data/raw、.git、.env 保持只读。",
+      );
     },
   });
 
@@ -466,6 +612,25 @@ export default function bioCodeReviewExtension(pi: ExtensionAPI): void {
     },
   });
 
+  pi.registerEntryRenderer<CheckReport>("bio-check-result", (entry, { expanded }, theme) => {
+    const data = entry.data ?? { ok: false, lines: [] };
+    const box = new Box(1, 1, (text) => theme.bg("customMessageBg", text));
+    box.addChild(
+      new Text(
+        theme.fg("accent", theme.bold(data.ok ? "生信代码检查：通过" : "生信代码检查：有偏差")),
+        0,
+        0,
+      ),
+    );
+    for (const line of data.lines) {
+      box.addChild(new Text(theme.fg("text", line), 0, 0));
+    }
+    if (expanded) {
+      box.addChild(new Text(theme.fg("dim", "重新检查：/bio-check"), 0, 0));
+    }
+    return box;
+  });
+
   pi.on("input", async (event, ctx) => {
     if (event.source === "extension" || !state.enabled || state.phase !== "planning") return;
     if (!isNaturalApproval(event.text)) return;
@@ -479,27 +644,38 @@ export default function bioCodeReviewExtension(pi: ExtensionAPI): void {
 
     const executionReason = executionToolReason(event.toolName);
     if (executionReason) {
+      if (state.executionAllowed) return;
       return {
         block: true,
-        reason: `生信代码审查模式禁止 AI 执行分析：${executionReason}。请只提供代码，由用户自行运行。`,
+        reason:
+          `生信代码审查模式默认禁止 AI 执行分析（${executionReason}）。` +
+          "要授权我执行，请运行 /bio-run；要彻底退出这个模式，请运行 /bio-reset。",
       };
     }
 
     const isMutation = event.toolName === "write" || event.toolName === "edit";
     if (!isMutation) return;
 
+    const inputPath = (event.input as { path?: unknown }).path;
+    if (typeof inputPath !== "string") {
+      return { block: true, reason: "写文件工具没有提供可核对的 path。" };
+    }
+
+    if (state.executionAllowed) {
+      const protectedReason = protectedWriteReason(inputPath);
+      if (protectedReason) {
+        return { block: true, reason: `已授权执行，但${protectedReason}仍然只读。` };
+      }
+      return;
+    }
+
     if (state.phase !== "coding") {
       return {
         block: true,
         reason: state.phase === "planning"
-          ? "方案尚未获用户批准，不能写文件。先提交方案并等待用户运行 /bio-approve。"
+          ? "方案尚未获用户批准，不能写文件。先提交方案并等用户说“同意”或运行 /bio-approve。"
           : "代码已经通过 /bio-check 锁定。如需修改，请使用 /bio-start 重新提交方案。",
       };
-    }
-
-    const inputPath = (event.input as { path?: unknown }).path;
-    if (typeof inputPath !== "string") {
-      return { block: true, reason: "写文件工具没有提供可核对的 path。" };
     }
 
     const root = resolve(ctx.cwd, state.deliveryRoot);
@@ -507,13 +683,18 @@ export default function bioCodeReviewExtension(pi: ExtensionAPI): void {
     if (!isInside(root, target)) {
       return {
         block: true,
-        reason: `只能写入独立交付目录 ${state.deliveryRoot}/；原始数据和工作区其他文件保持只读。`,
+        reason: `只能写入独立交付目录 ${state.deliveryRoot}/；要允许写到其它位置，请用户运行 /bio-run。`,
       };
     }
   });
 
   pi.on("before_agent_start", async () => {
     if (!state.enabled) return;
+
+    // 每轮都明确告知执行授权状态，否则 AI 在用户说“可以跑了”时只能猜。
+    const runNote = state.executionAllowed
+      ? "\n\n[执行授权：已授权]\n用户已用 /bio-run 授权你执行分析。你可以运行脚本、写入结果文件；data/raw、.git、.env 仍然只读。必须按真实输出报告，不得把预期结果写成已得到的结果。"
+      : "\n\n[执行授权：未授权]\n你不能运行任何分析。如果用户要求你执行（例如说“直接执行”“可以开始了”“回到普通模式”），不要猜命令、也不要反复重试，直接告诉用户：要授权请运行 /bio-run，要彻底退出这个模式请运行 /bio-reset。";
 
     if (state.phase === "planning") {
       return {
@@ -551,7 +732,9 @@ ${planSummary(state.plan)}
 4. 每个步骤使用方案声明的代码文件。代码内用中文说明“为什么这样做、会改变哪些数据”，不要只翻译函数名。
 5. 加入必要的停止检查：样本与分组对应、独立重复、输入数据类型、过滤前后数量、比较方向及输出表一致性。检查失败就停止，不能猜测或跳过。
 6. 提供 README.md，写清运行顺序、每一步输入输出、需要用户检查什么。没有真实运行输出，不得声称得到结果。
-7. 完成代码后，提醒用户亲自运行 /bio-check。不要自行调用任何执行工具。`,
+7. 完成代码后，提醒用户运行 /bio-check 审查，并说明：脚本由用户自己运行；如果要你执行，需要用户先运行 /bio-run 授权。
+8. 只用方案声明的文件名。确实需要新增或改名时，必须在回复里说明改了哪个文件、为什么，并请用户确认或重新提交方案。
+9. /bio-check 会核对方案与实际文件：缺文件或有未声明脚本时会列出偏差、不锁定。收到偏差清单后，按用户指示补齐文件或更新方案，不要沉默重试。${runNote}`,
         },
       };
     }
@@ -561,7 +744,7 @@ ${planSummary(state.plan)}
         customType: "bio-code-review-instructions",
         display: false,
         content: `[生信代码审查模式：代码已锁定]
-代码已经生成逐步对照文档。不要修改文件，也不要运行分析。若用户需要改方法，应重新使用 /bio-start 提交并批准新方案。`,
+代码已经生成逐步对照文档。不要修改文件，也不要运行分析。若用户需要改方法，应重新使用 /bio-start 提交并批准新方案。${runNote}`,
       },
     };
   });
